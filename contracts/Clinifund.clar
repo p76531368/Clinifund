@@ -10,6 +10,11 @@
 (define-constant ERR_TRIAL_COMPLETED (err u108))
 (define-constant ERR_NOT_RESEARCHER (err u109))
 (define-constant ERR_FUNDING_PERIOD_ENDED (err u110))
+(define-constant ERR_RATING_OUT_OF_RANGE (err u111))
+(define-constant ERR_REVIEW_EXISTS (err u112))
+(define-constant ERR_CANNOT_REVIEW_OWN_TRIAL (err u113))
+(define-constant ERR_INSUFFICIENT_CONTRIBUTION (err u114))
+(define-constant ERR_TRIAL_NOT_COMPLETED (err u115))
 
 (define-data-var trial-counter uint u0)
 
@@ -47,6 +52,39 @@
 (define-map researcher-trials
   { researcher: principal, trial-id: uint }
   { exists: bool }
+)
+
+(define-map researcher-reputation
+  { researcher: principal }
+  {
+    total-trials: uint,
+    completed-trials: uint,
+    total-rating: uint,
+    review-count: uint,
+    average-rating: uint,
+    total-funds-raised: uint,
+    successful-trials: uint,
+    reputation-score: uint
+  }
+)
+
+(define-map trial-reviews
+  { trial-id: uint, reviewer: principal }
+  {
+    rating: uint,
+    review-text: (string-ascii 300),
+    review-block: uint,
+    contribution-amount: uint
+  }
+)
+
+(define-map researcher-badges
+  { researcher: principal, badge-type: (string-ascii 50) }
+  {
+    earned: bool,
+    earned-block: uint,
+    criteria-met: (string-ascii 200)
+  }
 )
 
 (define-private (create-milestones 
@@ -118,6 +156,8 @@
     
     (unwrap! (create-milestones trial-id milestone-descriptions milestone-amounts u0) (err u107))
     
+    (unwrap! (update-researcher-reputation-on-trial-creation tx-sender funding-goal) (err u107))
+    
     (ok trial-id)
   )
 )
@@ -176,9 +216,12 @@
           is-completed: (is-eq new-completed-count (get milestone-count trial))
         })
       )
+      
+      (if (is-eq new-completed-count (get milestone-count trial))
+        (update-researcher-reputation-on-completion (get researcher trial) trial-id)
+        (ok true)
+      )
     )
-    
-    (ok true)
   )
 )
 
@@ -238,5 +281,209 @@
       percentage: (/ (* (get completed-milestones trial) u100) (get milestone-count trial))
     })
     ERR_TRIAL_NOT_FOUND
+  )
+)
+
+(define-private (update-researcher-reputation-on-trial-creation (researcher principal) (funding-goal uint))
+  (let (
+    (current-rep (default-to 
+      { total-trials: u0, completed-trials: u0, total-rating: u0, review-count: u0, 
+        average-rating: u0, total-funds-raised: u0, successful-trials: u0, reputation-score: u0 }
+      (map-get? researcher-reputation { researcher: researcher })
+    ))
+  )
+    (map-set researcher-reputation
+      { researcher: researcher }
+      (merge current-rep {
+        total-trials: (+ (get total-trials current-rep) u1),
+        total-funds-raised: (+ (get total-funds-raised current-rep) funding-goal)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-researcher-reputation-on-completion (researcher principal) (trial-id uint))
+  (let (
+    (current-rep (default-to 
+      { total-trials: u0, completed-trials: u0, total-rating: u0, review-count: u0, 
+        average-rating: u0, total-funds-raised: u0, successful-trials: u0, reputation-score: u0 }
+      (map-get? researcher-reputation { researcher: researcher })
+    ))
+    (trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR_TRIAL_NOT_FOUND))
+  )
+    (let (
+      (new-completed (+ (get completed-trials current-rep) u1))
+      (new-successful (if (>= (get current-funding trial) (get total-funding-goal trial))
+        (+ (get successful-trials current-rep) u1)
+        (get successful-trials current-rep)
+      ))
+      (new-reputation-score (calculate-reputation-score 
+        new-completed 
+        (get total-trials current-rep)
+        new-successful
+        (get average-rating current-rep)
+      ))
+    )
+      (map-set researcher-reputation
+        { researcher: researcher }
+        (merge current-rep {
+          completed-trials: new-completed,
+          successful-trials: new-successful,
+          reputation-score: new-reputation-score
+        })
+      )
+      (unwrap! (check-and-award-badges researcher new-completed new-successful (get total-funds-raised current-rep)) (err u107))
+      (ok true)
+    )
+  )
+)
+
+(define-private (calculate-reputation-score (completed uint) (total uint) (successful uint) (avg-rating uint))
+  (let (
+    (completion-rate (if (> total u0) (/ (* completed u100) total) u0))
+    (success-rate (if (> completed u0) (/ (* successful u100) completed) u0))
+    (rating-score (if (> avg-rating u0) (* avg-rating u20) u0))
+  )
+    (+ completion-rate success-rate rating-score)
+  )
+)
+
+(define-private (check-and-award-badges (researcher principal) (completed uint) (successful uint) (total-funds uint))
+  (begin
+    (if (>= completed u5)
+      (map-set researcher-badges
+        { researcher: researcher, badge-type: "Experienced Researcher" }
+        { earned: true, earned-block: stacks-block-height, criteria-met: "Completed 5 or more trials" }
+      )
+      true
+    )
+    
+    (if (>= successful u3)
+      (map-set researcher-badges
+        { researcher: researcher, badge-type: "Successful Researcher" }
+        { earned: true, earned-block: stacks-block-height, criteria-met: "Successfully funded 3 or more trials" }
+      )
+      true
+    )
+    
+    (if (>= total-funds u1000000)
+      (map-set researcher-badges
+        { researcher: researcher, badge-type: "High Volume Researcher" }
+        { earned: true, earned-block: stacks-block-height, criteria-met: "Raised over 1,000,000 microSTX in funding" }
+      )
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (submit-trial-review (trial-id uint) (rating uint) (review-text (string-ascii 300)))
+  (let (
+    (trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR_TRIAL_NOT_FOUND))
+    (funder-contribution (unwrap! (map-get? funders { trial-id: trial-id, funder: tx-sender }) ERR_INSUFFICIENT_CONTRIBUTION))
+    (existing-review (map-get? trial-reviews { trial-id: trial-id, reviewer: tx-sender }))
+  )
+    (asserts! (get is-completed trial) ERR_TRIAL_NOT_COMPLETED)
+    (asserts! (not (is-eq tx-sender (get researcher trial))) ERR_CANNOT_REVIEW_OWN_TRIAL)
+    (asserts! (>= (get amount funder-contribution) u1000) ERR_INSUFFICIENT_CONTRIBUTION)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_RATING_OUT_OF_RANGE)
+    (asserts! (is-none existing-review) ERR_REVIEW_EXISTS)
+    
+    (map-set trial-reviews
+      { trial-id: trial-id, reviewer: tx-sender }
+      {
+        rating: rating,
+        review-text: review-text,
+        review-block: stacks-block-height,
+        contribution-amount: (get amount funder-contribution)
+      }
+    )
+    
+    (unwrap! (update-researcher-rating (get researcher trial) rating) (err u107))
+    
+    (ok true)
+  )
+)
+
+(define-private (update-researcher-rating (researcher principal) (new-rating uint))
+  (let (
+    (current-rep (default-to 
+      { total-trials: u0, completed-trials: u0, total-rating: u0, review-count: u0, 
+        average-rating: u0, total-funds-raised: u0, successful-trials: u0, reputation-score: u0 }
+      (map-get? researcher-reputation { researcher: researcher })
+    ))
+  )
+    (let (
+      (new-total-rating (+ (get total-rating current-rep) new-rating))
+      (new-review-count (+ (get review-count current-rep) u1))
+      (new-average (/ new-total-rating new-review-count))
+      (new-reputation-score (calculate-reputation-score 
+        (get completed-trials current-rep)
+        (get total-trials current-rep)
+        (get successful-trials current-rep)
+        new-average
+      ))
+    )
+      (map-set researcher-reputation
+        { researcher: researcher }
+        (merge current-rep {
+          total-rating: new-total-rating,
+          review-count: new-review-count,
+          average-rating: new-average,
+          reputation-score: new-reputation-score
+        })
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-read-only (get-researcher-reputation (researcher principal))
+  (map-get? researcher-reputation { researcher: researcher })
+)
+
+(define-read-only (get-trial-review (trial-id uint) (reviewer principal))
+  (map-get? trial-reviews { trial-id: trial-id, reviewer: reviewer })
+)
+
+(define-read-only (get-researcher-badge (researcher principal) (badge-type (string-ascii 50)))
+  (map-get? researcher-badges { researcher: researcher, badge-type: badge-type })
+)
+
+(define-read-only (get-researcher-rank (researcher principal))
+  (match (map-get? researcher-reputation { researcher: researcher })
+    rep (ok {
+      reputation-score: (get reputation-score rep),
+      rank: (if (>= (get reputation-score rep) u300) "Expert"
+        (if (>= (get reputation-score rep) u200) "Advanced"
+          (if (>= (get reputation-score rep) u100) "Intermediate"
+            (if (>= (get reputation-score rep) u50) "Novice"
+              "Beginner"
+            )
+          )
+        )
+      )
+    })
+    ERR_TRIAL_NOT_FOUND
+  )
+)
+
+(define-read-only (calculate-funding-bonus (researcher principal) (base-amount uint))
+  (match (map-get? researcher-reputation { researcher: researcher })
+    rep (let (
+      (reputation-score (get reputation-score rep))
+      (bonus-multiplier (if (>= reputation-score u300) u120
+        (if (>= reputation-score u200) u110
+          (if (>= reputation-score u100) u105
+            u100
+          )
+        )
+      ))
+    )
+      (ok (/ (* base-amount bonus-multiplier) u100))
+    )
+    (ok base-amount)
   )
 )
