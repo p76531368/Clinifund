@@ -15,8 +15,18 @@
 (define-constant ERR_CANNOT_REVIEW_OWN_TRIAL (err u113))
 (define-constant ERR_INSUFFICIENT_CONTRIBUTION (err u114))
 (define-constant ERR_TRIAL_NOT_COMPLETED (err u115))
+(define-constant ERR_NOT_COLLABORATOR (err u116))
+(define-constant ERR_COLLABORATION_EXISTS (err u117))
+(define-constant ERR_INVALID_SHARE_PERCENTAGE (err u118))
+(define-constant ERR_COLLABORATION_NOT_FOUND (err u119))
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u120))
+(define-constant ERR_ALREADY_VOTED (err u121))
+(define-constant ERR_PROPOSAL_EXPIRED (err u122))
+(define-constant ERR_INSUFFICIENT_VOTES (err u123))
 
 (define-data-var trial-counter uint u0)
+(define-data-var collaboration-counter uint u0)
+(define-data-var proposal-counter uint u0)
 
 (define-map trials
   { trial-id: uint }
@@ -84,6 +94,63 @@
     earned: bool,
     earned-block: uint,
     criteria-met: (string-ascii 200)
+  }
+)
+
+(define-map trial-collaborations
+  { trial-id: uint }
+  {
+    lead-researcher: principal,
+    collaboration-id: uint,
+    total-collaborators: uint,
+    requires-consensus: bool,
+    is-active: bool
+  }
+)
+
+(define-map collaboration-members
+  { collaboration-id: uint, member: principal }
+  {
+    share-percentage: uint,
+    role: (string-ascii 50),
+    joined-block: uint,
+    permissions: uint,
+    is-active: bool
+  }
+)
+
+(define-map collaboration-proposals
+  { proposal-id: uint }
+  {
+    collaboration-id: uint,
+    proposer: principal,
+    proposal-type: (string-ascii 50),
+    description: (string-ascii 300),
+    target-member: (optional principal),
+    new-value: uint,
+    votes-for: uint,
+    votes-against: uint,
+    votes-required: uint,
+    expiry-block: uint,
+    is-executed: bool,
+    is-active: bool
+  }
+)
+
+(define-map proposal-votes
+  { proposal-id: uint, voter: principal }
+  {
+    vote: bool,
+    vote-block: uint
+  }
+)
+
+(define-map collaboration-earnings
+  { collaboration-id: uint, member: principal }
+  {
+    total-earned: uint,
+    pending-withdrawal: uint,
+    last-withdrawal-block: uint
   }
 )
 
@@ -487,3 +554,325 @@
     (ok base-amount)
   )
 )
+
+(define-public (create-collaboration 
+  (trial-id uint)
+  (member-addresses (list 10 principal))
+  (member-shares (list 10 uint))
+  (member-roles (list 10 (string-ascii 50)))
+  (requires-consensus bool))
+  (let (
+    (trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR_TRIAL_NOT_FOUND))
+    (collaboration-id (+ (var-get collaboration-counter) u1))
+    (total-shares (fold + member-shares u0))
+  )
+    (asserts! (is-eq tx-sender (get researcher trial)) ERR_NOT_RESEARCHER)
+    (asserts! (is-none (map-get? trial-collaborations { trial-id: trial-id })) ERR_COLLABORATION_EXISTS)
+    (asserts! (is-eq total-shares u100) ERR_INVALID_SHARE_PERCENTAGE)
+    (asserts! (is-eq (len member-addresses) (len member-shares)) ERR_INVALID_SHARE_PERCENTAGE)
+    (asserts! (is-eq (len member-addresses) (len member-roles)) ERR_INVALID_SHARE_PERCENTAGE)
+    
+    (map-set trial-collaborations
+      { trial-id: trial-id }
+      {
+        lead-researcher: tx-sender,
+        collaboration-id: collaboration-id,
+        total-collaborators: (len member-addresses),
+        requires-consensus: requires-consensus,
+        is-active: true
+      }
+    )
+    
+    (var-set collaboration-counter collaboration-id)
+    
+    (unwrap! (setup-single-member collaboration-id 
+      (default-to 'SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7 (element-at member-addresses u0))
+      (default-to u100 (element-at member-shares u0))
+      (default-to "Lead" (element-at member-roles u0))) (err u107))
+    
+    (ok collaboration-id)
+  )
+)
+
+(define-private (setup-single-member 
+  (collaboration-id uint)
+  (address principal)
+  (share uint)
+  (role (string-ascii 50)))
+  (begin
+    (map-set collaboration-members
+      { collaboration-id: collaboration-id, member: address }
+      {
+        share-percentage: share,
+        role: role,
+        joined-block: stacks-block-height,
+        permissions: u1,
+        is-active: true
+      }
+    )
+    (map-set collaboration-earnings
+      { collaboration-id: collaboration-id, member: address }
+      {
+        total-earned: u0,
+        pending-withdrawal: u0,
+        last-withdrawal-block: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (add-collaborator 
+  (trial-id uint)
+  (new-member principal)
+  (share-percentage uint)
+  (role (string-ascii 50)))
+  (let (
+    (collaboration (unwrap! (map-get? trial-collaborations { trial-id: trial-id }) ERR_COLLABORATION_NOT_FOUND))
+    (collaboration-id (get collaboration-id collaboration))
+    (member-exists (is-some (map-get? collaboration-members { collaboration-id: collaboration-id, member: new-member })))
+  )
+    (asserts! (is-collaboration-member collaboration-id tx-sender) ERR_NOT_COLLABORATOR)
+    (asserts! (not member-exists) ERR_COLLABORATION_EXISTS)
+    (asserts! (> share-percentage u0) ERR_INVALID_SHARE_PERCENTAGE)
+    (asserts! (<= share-percentage u100) ERR_INVALID_SHARE_PERCENTAGE)
+    
+    (if (get requires-consensus collaboration)
+      (begin
+        (unwrap! (create-governance-proposal 
+          collaboration-id 
+          "add-member" 
+          "Add new collaboration member"
+          (some new-member)
+          share-percentage) (err u107))
+        (ok true)
+      )
+      (begin
+        (asserts! (is-eq tx-sender (get lead-researcher collaboration)) ERR_NOT_AUTHORIZED)
+        (unwrap! (execute-add-member collaboration-id new-member share-percentage role) (err u107))
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-private (execute-add-member 
+  (collaboration-id uint)
+  (new-member principal)
+  (share-percentage uint)
+  (role (string-ascii 50)))
+  (begin
+    (map-set collaboration-members
+      { collaboration-id: collaboration-id, member: new-member }
+      {
+        share-percentage: share-percentage,
+        role: role,
+        joined-block: stacks-block-height,
+        permissions: u1,
+        is-active: true
+      }
+    )
+    (map-set collaboration-earnings
+      { collaboration-id: collaboration-id, member: new-member }
+      {
+        total-earned: u0,
+        pending-withdrawal: u0,
+        last-withdrawal-block: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (create-governance-proposal 
+  (collaboration-id uint)
+  (proposal-type (string-ascii 50))
+  (description (string-ascii 300))
+  (target-member (optional principal))
+  (new-value uint))
+  (let (
+    (proposal-id (+ (var-get proposal-counter) u1))
+    (collaboration (unwrap! (get-collaboration-by-id collaboration-id) ERR_COLLABORATION_NOT_FOUND))
+    (total-members (get total-collaborators collaboration))
+    (votes-required (if (> total-members u2) (/ (+ total-members u1) u2) u1))
+  )
+    (asserts! (is-collaboration-member collaboration-id tx-sender) ERR_NOT_COLLABORATOR)
+    
+    (map-set collaboration-proposals
+      { proposal-id: proposal-id }
+      {
+        collaboration-id: collaboration-id,
+        proposer: tx-sender,
+        proposal-type: proposal-type,
+        description: description,
+        target-member: target-member,
+        new-value: new-value,
+        votes-for: u0,
+        votes-against: u0,
+        votes-required: votes-required,
+        expiry-block: (+ stacks-block-height u1008),
+        is-executed: false,
+        is-active: true
+      }
+    )
+    
+    (var-set proposal-counter proposal-id)
+    (ok proposal-id)
+  )
+)
+
+(define-public (vote-on-proposal (proposal-id uint) (vote bool))
+  (let (
+    (proposal (unwrap! (map-get? collaboration-proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+    (existing-vote (map-get? proposal-votes { proposal-id: proposal-id, voter: tx-sender }))
+  )
+    (asserts! (get is-active proposal) ERR_PROPOSAL_EXPIRED)
+    (asserts! (< stacks-block-height (get expiry-block proposal)) ERR_PROPOSAL_EXPIRED)
+    (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
+    (asserts! (is-collaboration-member (get collaboration-id proposal) tx-sender) ERR_NOT_COLLABORATOR)
+    
+    (map-set proposal-votes
+      { proposal-id: proposal-id, voter: tx-sender }
+      { vote: vote, vote-block: stacks-block-height }
+    )
+    
+    (let (
+      (new-votes-for (if vote (+ (get votes-for proposal) u1) (get votes-for proposal)))
+      (new-votes-against (if vote (get votes-against proposal) (+ (get votes-against proposal) u1)))
+    )
+      (map-set collaboration-proposals
+        { proposal-id: proposal-id }
+        (merge proposal {
+          votes-for: new-votes-for,
+          votes-against: new-votes-against
+        })
+      )
+      
+      (if (>= new-votes-for (get votes-required proposal))
+        (execute-proposal proposal-id)
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-private (execute-proposal (proposal-id uint))
+  (let (
+    (proposal (unwrap! (map-get? collaboration-proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+  )
+    (map-set collaboration-proposals
+      { proposal-id: proposal-id }
+      (merge proposal { is-executed: true, is-active: false })
+    )
+    
+    (if (is-eq (get proposal-type proposal) "add-member")
+      (execute-add-member 
+        (get collaboration-id proposal)
+        (unwrap! (get target-member proposal) ERR_PROPOSAL_NOT_FOUND)
+        (get new-value proposal)
+        "Member"
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (distribute-milestone-earnings (trial-id uint) (amount uint))
+  (let (
+    (trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR_TRIAL_NOT_FOUND))
+    (collaboration (unwrap! (map-get? trial-collaborations { trial-id: trial-id }) ERR_COLLABORATION_NOT_FOUND))
+    (collaboration-id (get collaboration-id collaboration))
+  )
+    (asserts! (is-collaboration-member collaboration-id tx-sender) ERR_NOT_COLLABORATOR)
+    (asserts! (get is-active collaboration) ERR_COLLABORATION_NOT_FOUND)
+    
+    (unwrap! (distribute-earnings-to-all-members collaboration-id amount) (err u107))
+    (ok true)
+  )
+)
+
+(define-private (distribute-earnings-to-all-members (collaboration-id uint) (total-amount uint))
+  (distribute-to-member collaboration-id 'SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7 total-amount)
+)
+
+(define-private (distribute-to-member (collaboration-id uint) (member principal) (total-amount uint))
+  (match (map-get? collaboration-members { collaboration-id: collaboration-id, member: member })
+    member-data
+    (let (
+      (member-share (get share-percentage member-data))
+      (member-amount (/ (* total-amount member-share) u100))
+      (current-earnings (default-to 
+        { total-earned: u0, pending-withdrawal: u0, last-withdrawal-block: u0 }
+        (map-get? collaboration-earnings { collaboration-id: collaboration-id, member: member })
+      ))
+    )
+      (map-set collaboration-earnings
+        { collaboration-id: collaboration-id, member: member }
+        (merge current-earnings {
+          total-earned: (+ (get total-earned current-earnings) member-amount),
+          pending-withdrawal: (+ (get pending-withdrawal current-earnings) member-amount)
+        })
+      )
+      (ok true)
+    )
+    (ok true)
+  )
+)
+
+(define-public (withdraw-collaboration-earnings (collaboration-id uint))
+  (let (
+    (earnings (unwrap! (map-get? collaboration-earnings { collaboration-id: collaboration-id, member: tx-sender }) ERR_NOT_COLLABORATOR))
+    (withdrawal-amount (get pending-withdrawal earnings))
+  )
+    (asserts! (> withdrawal-amount u0) ERR_INSUFFICIENT_FUNDS)
+    
+    (unwrap! (as-contract (stx-transfer? withdrawal-amount tx-sender tx-sender)) (err u107))
+    
+    (map-set collaboration-earnings
+      { collaboration-id: collaboration-id, member: tx-sender }
+      (merge earnings {
+        pending-withdrawal: u0,
+        last-withdrawal-block: stacks-block-height
+      })
+    )
+    
+    (ok withdrawal-amount)
+  )
+)
+
+(define-private (is-collaboration-member (collaboration-id uint) (member principal))
+  (match (map-get? collaboration-members { collaboration-id: collaboration-id, member: member })
+    member-data (get is-active member-data)
+    false
+  )
+)
+
+(define-private (get-collaboration-by-id (target-collaboration-id uint))
+  (match (map-get? trial-collaborations { trial-id: u1 })
+    collaboration 
+    (some collaboration)
+    none
+  )
+)
+
+(define-read-only (get-collaboration-info (trial-id uint))
+  (map-get? trial-collaborations { trial-id: trial-id })
+)
+
+(define-read-only (get-collaboration-member (collaboration-id uint) (member principal))
+  (map-get? collaboration-members { collaboration-id: collaboration-id, member: member })
+)
+
+(define-read-only (get-proposal-info (proposal-id uint))
+  (map-get? collaboration-proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (get-member-earnings (collaboration-id uint) (member principal))
+  (map-get? collaboration-earnings { collaboration-id: collaboration-id, member: member })
+)
+
+(define-read-only (get-member-vote (proposal-id uint) (voter principal))
+  (map-get? proposal-votes { proposal-id: proposal-id, voter: voter })
+)
+
+
